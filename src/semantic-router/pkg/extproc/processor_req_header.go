@@ -66,7 +66,11 @@ func (r *OpenAIRouter) handleRequestHeaders(v *ext_proc.ProcessingRequest_Reques
 	if validationResp := r.validateRequestHeaders(method, path); validationResp != nil {
 		return validationResp, nil
 	}
-	return newContinueRequestHeadersResponse(buildIdentityEncodingRequestMutation()), nil
+	mutation := buildIdentityEncodingRequestMutation()
+	if r.CredentialResolver != nil {
+		mutation.RemoveHeaders = append(mutation.RemoveHeaders, r.CredentialResolver.HeadersToStrip()...)
+	}
+	return newContinueRequestHeadersResponse(mutation), nil
 }
 
 func startRequestHeaderSpan(

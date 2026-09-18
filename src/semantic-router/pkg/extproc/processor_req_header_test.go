@@ -4,9 +4,11 @@ import (
 	"testing"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	http_ext "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/authz"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/llmprotocol"
 )
 
@@ -64,6 +66,53 @@ func TestApplyHeaderPassThroughPolicyDropsOnlyTransportHeaders(t *testing.T) {
 		}
 	}
 	applyHeaderPassThroughPolicy(nil)
+}
+
+func TestHandleRequestHeadersRemovesInjectedCredentialsBeforeFullDuplexForwarding(t *testing.T) {
+	const credentialHeader = "x-custom-openai-key"
+	router := &OpenAIRouter{
+		CredentialResolver: authz.NewCredentialResolver(
+			authz.NewHeaderInjectionProvider(map[string]string{"openai": credentialHeader}),
+		),
+	}
+	request := newRequestHeaders("POST", "/v1/chat/completions")
+	request.RequestHeaders.Headers.Headers = append(
+		request.RequestHeaders.Headers.Headers,
+		&core.HeaderValue{Key: credentialHeader, Value: "sk-user-secret"},
+	)
+	ctx := &RequestContext{Headers: make(map[string]string)}
+	stream := NewMockStream(nil)
+	processingRequest := &ext_proc.ProcessingRequest{
+		ProtocolConfig: &ext_proc.ProtocolConfiguration{
+			RequestBodyMode: http_ext.ProcessingMode_FULL_DUPLEX_STREAMED,
+		},
+		Request: request,
+	}
+
+	if err := router.handleProcessRequest(stream, processingRequest, ctx); err != nil {
+		t.Fatalf("handleProcessRequest() error = %v", err)
+	}
+	if len(stream.Responses) != 1 {
+		t.Fatalf("response count = %d, want 1", len(stream.Responses))
+	}
+	response := stream.Responses[0]
+	removed := response.GetRequestHeaders().GetResponse().GetHeaderMutation().GetRemoveHeaders()
+	found := false
+	for _, header := range removed {
+		if header == credentialHeader {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("credential header was not removed before forwarding: %v", removed)
+	}
+	if !ctx.FullDuplexRequestBody {
+		t.Fatal("full-duplex request mode was not negotiated")
+	}
+	if got := ctx.Headers[credentialHeader]; got != "sk-user-secret" {
+		t.Fatalf("captured credential = %q, want it retained for provider resolution", got)
+	}
 }
 
 func TestValidatePublicGenerationEndpoints(t *testing.T) {
